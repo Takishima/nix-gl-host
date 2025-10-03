@@ -12,11 +12,12 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 from glob import glob
 from typing import List, Literal, Dict, Tuple, TypedDict, TextIO, Optional
 
 IN_NIX_STORE = False
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 
 
 if IN_NIX_STORE:
@@ -38,10 +39,14 @@ class ResolvedLib:
         fullpath: str,
         last_modification: Optional[float] = None,
         size: Optional[int] = None,
+        is_symlink: bool = False,
+        symlink_target: Optional[str] = None,
     ):
         self.name: str = name
         self.dirpath: str = dirpath
         self.fullpath: str = fullpath
+        self.is_symlink: bool = is_symlink
+        self.symlink_target: Optional[str] = symlink_target
         if size is None or last_modification is None:
             stat = os.stat(fullpath)
             self.last_modification: float = stat.st_mtime
@@ -51,7 +56,7 @@ class ResolvedLib:
             self.size = size
 
     def __repr__(self):
-        return f"ResolvedLib<{self.name}, {self.dirpath}, {self.fullpath}, {self.last_modification}, {self.size}>"
+        return f"ResolvedLib<{self.name}, {self.dirpath}, {self.fullpath}, {self.last_modification}, {self.size}, is_symlink={self.is_symlink}, target={self.symlink_target}>"
 
     def to_dict(self) -> Dict:
         return {
@@ -60,11 +65,21 @@ class ResolvedLib:
             "fullpath": self.fullpath,
             "last_modification": self.last_modification,
             "size": self.size,
+            "is_symlink": self.is_symlink,
+            "symlink_target": self.symlink_target,
         }
 
     def __hash__(self):
         return hash(
-            (self.name, self.dirpath, self.fullpath, self.last_modification, self.size)
+            (
+                self.name,
+                self.dirpath,
+                self.fullpath,
+                self.last_modification,
+                self.size,
+                self.is_symlink,
+                self.symlink_target,
+            )
         )
 
     def __eq__(self, o):
@@ -74,12 +89,20 @@ class ResolvedLib:
             and self.dirpath == o.dirpath
             and self.last_modification == o.last_modification
             and self.size == o.size
+            and self.is_symlink == o.is_symlink
+            and self.symlink_target == o.symlink_target
         )
 
     @classmethod
     def from_dict(cls, d: Dict):
         return ResolvedLib(
-            d["name"], d["dirpath"], d["fullpath"], d["last_modification"], d["size"]
+            d["name"],
+            d["dirpath"],
+            d["fullpath"],
+            d["last_modification"],
+            d["size"],
+            d.get("is_symlink", False),
+            d.get("symlink_target", None),
         )
 
 
@@ -319,11 +342,25 @@ def resolve_libraries(path: str, files_patterns: List[str]) -> List[ResolvedLib]
         return False
 
     try:
-        for fname in os.listdir(path):
-            abs_file_path = os.path.abspath(os.path.join(path, fname))
-            if os.path.isfile(abs_file_path) and is_dso_matching_pattern(abs_file_path):
+        path_obj = Path(path)
+        for item in path_obj.iterdir():
+            # Check if it's a file or symlink and matches pattern
+            if (item.is_file() or item.is_symlink()) and is_dso_matching_pattern(
+                str(item)
+            ):
+                is_symlink = item.is_symlink()
+                symlink_target = None
+                if is_symlink:
+                    # Get the symlink target (relative path as stored in the symlink)
+                    symlink_target = str(item.readlink())
                 libraries.append(
-                    ResolvedLib(name=fname, dirpath=path, fullpath=abs_file_path)
+                    ResolvedLib(
+                        name=item.name,
+                        dirpath=str(path_obj),
+                        fullpath=str(item.absolute()),
+                        is_symlink=is_symlink,
+                        symlink_target=symlink_target,
+                    )
                 )
     except PermissionError as err:
         print(f"WARNING: {err}", file=sys.stderr)
@@ -343,18 +380,52 @@ def copy_and_patch_libs(
 
     We also don't want to directly modify the host DSOs. In the end,
     we first copy them to the user's personal cache directory, we then
-    alter their runpath to point to the cache directory."""
+    alter their runpath to point to the cache directory.
+
+    This function preserves symlink structure by first copying real files,
+    then creating symlinks."""
     rpath = rpath if (rpath is not None) else dest_dir
+    dest_path = Path(dest_dir)
     new_paths: List[str] = []
-    for dso in dsos:
-        basename = os.path.basename(dso.fullpath)
-        newpath = os.path.join(dest_dir, basename)
-        log_info(f"Copying and patching {dso} to {newpath}")
+
+    # Separate real files and symlinks
+    real_files = [dso for dso in dsos if not dso.is_symlink]
+    symlinks = [dso for dso in dsos if dso.is_symlink]
+
+    # First, copy all real files
+    for dso in real_files:
+        source_path = Path(dso.fullpath)
+        newpath = dest_path / source_path.name
+        log_info(f"Copying {dso.fullpath} to {newpath}")
         shutil.copyfile(dso.fullpath, newpath)
         # Provide write permissions to ensure we can patch this binary.
-        os.chmod(newpath, os.stat(dso.fullpath).st_mode | stat.S_IWUSR)
-        new_paths.append(newpath)
-    patch_dsos(new_paths, rpath)
+        newpath.chmod(newpath.stat().st_mode | stat.S_IWUSR)
+        new_paths.append(str(newpath))
+
+    # Then, recreate all symlinks with their relative targets
+    # No need to sort - symlinks can be created even if their target doesn't exist yet
+    for dso in symlinks:
+        source_path = Path(dso.fullpath)
+        newpath = dest_path / source_path.name
+
+        # Validate that symlink target is in the same directory
+        if dso.symlink_target and (
+            "/" in dso.symlink_target or dso.symlink_target.startswith("..")
+        ):
+            print(
+                f"WARNING: Symlink {dso.name} points outside its directory: {dso.symlink_target}. "
+                f"This may result in a broken symlink in the cache.",
+                file=sys.stderr,
+            )
+
+        log_info(f"Creating symlink {newpath} -> {dso.symlink_target}")
+        if newpath.exists() or newpath.is_symlink():
+            newpath.unlink()
+        newpath.symlink_to(dso.symlink_target)
+
+    # Only patch real files, not symlinks
+    if new_paths:
+        patch_dsos(new_paths, rpath)
 
 
 def log_info(string: str) -> None:
